@@ -48,6 +48,10 @@ pub fn parse_netex(
     // Map Quay -> parent StopPlace
     let mut quay_to_parent: FxHashMap<String, String> = FxHashMap::default();
 
+    // Map any stop-like id (StopPlace, Quay, ScheduledStopPoint) -> human-friendly name
+    // Used when synthesizing route names so they show station names instead of raw ids.
+    let mut stop_labels: FxHashMap<String, String> = FxHashMap::default();
+
     // Map route_id (Line id or synthetic id) -> agency_id (Operator id)
     let mut line_to_agency: FxHashMap<String, String> = FxHashMap::default();
     
@@ -407,6 +411,12 @@ pub fn parse_netex(
                                 location_type: Some(0),
                                 parent_station,
                             });
+
+                            // Label for human-friendly naming
+                            stop_labels.insert(
+                                current_sched_stop_id.clone(),
+                                current_sched_stop_name.clone(),
+                            );
                         }
                         current_sched_stop_id.clear();
                         current_sched_stop_name.clear();
@@ -422,6 +432,13 @@ pub fn parse_netex(
                             location_type: Some(1),
                             parent_station: None,
                         });
+
+                        // Label for human-friendly naming
+                        stop_labels.insert(
+                            current_stop_place_id.clone(),
+                            current_stop_place_name.clone(),
+                        );
+
                         current_stop_place_name.clear();
                         current_stop_place_lat = 0.0;
                         current_stop_place_lon = 0.0;
@@ -457,6 +474,10 @@ pub fn parse_netex(
                             parent_station: Some(current_stop_place_id.clone()),
                         });
                         quay_to_parent.insert(current_quay_id.clone(), current_stop_place_id.clone());
+
+                        // Label for human-friendly naming
+                        stop_labels.insert(current_quay_id.clone(), current_quay_name.clone());
+
                         current_quay_name.clear();
                     }
                     "Line" => {
@@ -477,26 +498,48 @@ pub fn parse_netex(
                         // Resolve synthesized route
                         let synthetic_route_id = if current_vj_line_ref.is_empty() {
                             if let (Some(first), Some(last)) = (current_calls.first(), current_calls.last()) {
-                                let first_ref = first.quay_ref.as_ref().or(first.stop_point_ref.as_ref())
+                                let first_ref = first
+                                    .quay_ref
+                                    .as_ref()
+                                    .or(first.stop_point_ref.as_ref())
                                     .or_else(|| first.spijp_ref.as_ref().and_then(|r| spijp_to_stop.get(r)));
                                 let start = first_ref.unwrap_or(&"".to_string()).clone();
-                                
-                                let last_ref = last.quay_ref.as_ref().or(last.stop_point_ref.as_ref())
+
+                                let last_ref = last
+                                    .quay_ref
+                                    .as_ref()
+                                    .or(last.stop_point_ref.as_ref())
                                     .or_else(|| last.spijp_ref.as_ref().and_then(|r| spijp_to_stop.get(r)));
                                 let end = last_ref.unwrap_or(&"".to_string()).clone();
-                                
-                                let start_parent = quay_to_parent.get(&start).unwrap_or(&start).clone();
-                                let end_parent = quay_to_parent.get(&end).unwrap_or(&end).clone();
-                                
-                                let r_id = format!("{}_to_{}", start_parent, end_parent);
-                                
+
+                                // Prefer parent StopPlace when available, otherwise fall back to
+                                // the original stop id. These ids are used for the technical
+                                // route_id, while human-readable names below use stop_labels.
+                                let start_parent_id = quay_to_parent.get(&start).unwrap_or(&start).clone();
+                                let end_parent_id = quay_to_parent.get(&end).unwrap_or(&end).clone();
+
+                                // Human-friendly labels for names
+                                let start_label = stop_labels
+                                    .get(&start_parent_id)
+                                    .or_else(|| stop_labels.get(&start))
+                                    .cloned()
+                                    .unwrap_or_else(|| start_parent_id.clone());
+                                let end_label = stop_labels
+                                    .get(&end_parent_id)
+                                    .or_else(|| stop_labels.get(&end))
+                                    .cloned()
+                                    .unwrap_or_else(|| end_parent_id.clone());
+
+                                let r_id = format!("{}_to_{}", start_parent_id, end_parent_id);
+
                                 // Add route if missing
                                 if !routes.iter().any(|r| r.route_id == r_id) {
+                                    let name = format!("{} to {}", start_label, end_label);
                                     routes.push(Route {
                                         route_id: r_id.clone(),
                                         agency_id: None,
-                                        route_short_name: format!("{} to {}", start_parent, end_parent),
-                                        route_long_name: format!("{} to {}", start_parent, end_parent),
+                                        route_short_name: name.clone(),
+                                        route_long_name: name,
                                         route_type: 2,
                                     });
                                 }
