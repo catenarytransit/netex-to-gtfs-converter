@@ -336,6 +336,12 @@ pub fn parse_netex(path: &Path) -> Result<GtfsModel, Box<dyn std::error::Error>>
                     }
                     "ScheduledStopPoint" => {
                         if !current_sched_stop_id.is_empty() {
+                            let parent_station = if current_sched_stop_id.contains("ScheduledStopPoint:") {
+                                Some(current_sched_stop_id.replace("ScheduledStopPoint:", "StopPlace:"))
+                            } else {
+                                None
+                            };
+
                             stops.push(Stop {
                                 stop_id: current_sched_stop_id.clone(),
                                 stop_name: current_sched_stop_name.clone(),
@@ -343,7 +349,7 @@ pub fn parse_netex(path: &Path) -> Result<GtfsModel, Box<dyn std::error::Error>>
                                 stop_lon: current_sched_stop_lon,
                                 // Treat ScheduledStopPoint as a regular stop/platform
                                 location_type: Some(0),
-                                parent_station: None,
+                                parent_station,
                             });
                         }
                         current_sched_stop_id.clear();
