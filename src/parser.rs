@@ -50,6 +50,12 @@ pub fn parse_netex(path: &Path) -> Result<GtfsModel, Box<dyn std::error::Error>>
 
     let mut current_quay_id = String::new();
     let mut current_quay_name = String::new();
+
+    // ScheduledStopPoint state (for stop_ids used in stop_times)
+    let mut current_sched_stop_id = String::new();
+    let mut current_sched_stop_name = String::new();
+    let mut current_sched_stop_lat = 0.0;
+    let mut current_sched_stop_lon = 0.0;
     
     let mut current_line_id = String::new();
     let mut current_line_name = String::new();
@@ -106,6 +112,14 @@ pub fn parse_netex(path: &Path) -> Result<GtfsModel, Box<dyn std::error::Error>>
                             current_uic_id = id;
                             current_uic_from.clear();
                             current_uic_to.clear();
+                        }
+                    }
+                    "ScheduledStopPoint" => {
+                        if let Some(id) = get_attr("id") {
+                            current_sched_stop_id = id;
+                            current_sched_stop_name.clear();
+                            current_sched_stop_lat = 0.0;
+                            current_sched_stop_lon = 0.0;
                         }
                     }
                     "StopPlace" => {
@@ -267,6 +281,8 @@ pub fn parse_netex(path: &Path) -> Result<GtfsModel, Box<dyn std::error::Error>>
                             current_stop_place_name = text_buf.clone();
                         } else if parent == "Quay" {
                             current_quay_name = text_buf.clone();
+                        } else if parent == "ScheduledStopPoint" {
+                            current_sched_stop_name = text_buf.clone();
                         } else if parent == "Line" {
                             current_line_name = text_buf.clone();
                         } else if parent == "ServiceJourney" || parent == "VehicleJourney" {
@@ -277,6 +293,8 @@ pub fn parse_netex(path: &Path) -> Result<GtfsModel, Box<dyn std::error::Error>>
                         if let Ok(v) = text_buf.parse::<f64>() {
                             if parent == "Location" && gparent == "Centroid" && ggparent == "StopPlace" {
                                 current_stop_place_lon = v;
+                            } else if parent == "Location" && gparent == "ScheduledStopPoint" {
+                                current_sched_stop_lon = v;
                             }
                         }
                     }
@@ -284,6 +302,8 @@ pub fn parse_netex(path: &Path) -> Result<GtfsModel, Box<dyn std::error::Error>>
                         if let Ok(v) = text_buf.parse::<f64>() {
                             if parent == "Location" && gparent == "Centroid" && ggparent == "StopPlace" {
                                 current_stop_place_lat = v;
+                            } else if parent == "Location" && gparent == "ScheduledStopPoint" {
+                                current_sched_stop_lat = v;
                             }
                         }
                     }
@@ -313,6 +333,23 @@ pub fn parse_netex(path: &Path) -> Result<GtfsModel, Box<dyn std::error::Error>>
                         if parent == "TimetabledPassingTime" || parent == "Call" || parent == "TargetPassingTime" {
                             current_call.dep_time = Some(text_buf.clone());
                         }
+                    }
+                    "ScheduledStopPoint" => {
+                        if !current_sched_stop_id.is_empty() {
+                            stops.push(Stop {
+                                stop_id: current_sched_stop_id.clone(),
+                                stop_name: current_sched_stop_name.clone(),
+                                stop_lat: current_sched_stop_lat,
+                                stop_lon: current_sched_stop_lon,
+                                // Treat ScheduledStopPoint as a regular stop/platform
+                                location_type: Some(0),
+                                parent_station: None,
+                            });
+                        }
+                        current_sched_stop_id.clear();
+                        current_sched_stop_name.clear();
+                        current_sched_stop_lat = 0.0;
+                        current_sched_stop_lon = 0.0;
                     }
                     "StopPlace" => {
                         stops.push(Stop {
