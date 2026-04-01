@@ -11,3 +11,4 @@ quick-xml = "0.36"
 rustc-hash = "2.1.2"
 serde = { version = "1.0.218", features = ["derive"] }
 zip = "2.2.3"
+chrono = "0.4.38"

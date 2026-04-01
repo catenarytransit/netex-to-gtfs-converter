@@ -1,4 +1,5 @@
 use crate::gtfs::{Agency, Calendar, CalendarDate, Route, Stop, StopTime, Trip};
+use chrono::{Datelike, Duration, NaiveDate};
 use quick_xml::events::Event;
 use quick_xml::Reader;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -93,7 +94,9 @@ pub fn parse_netex(
     let mut current_uic_id = String::new();
     let mut current_uic_from = String::new();
     let mut current_uic_to = String::new();
+    let mut current_uic_bits = String::new();
     let mut uic_periods: FxHashMap<String, (String, String)> = FxHashMap::default();
+    let mut uic_period_bits: FxHashMap<String, String> = FxHashMap::default();
 
     // Track which service_ids actually appear in trips
     let mut used_service_ids: FxHashSet<String> = FxHashSet::default();
@@ -304,7 +307,8 @@ pub fn parse_netex(
 
                 match name.as_str() {
                     "DaysOfWeek" => {
-                        if gparent == "DayType" {
+                        // Handle both direct and nested DaysOfWeek under DayType
+                        if parent == "DayType" || gparent == "DayType" || ggparent == "DayType" {
                             for token in text_buf.split_whitespace() {
                                 let idx = match token {
                                     "Monday" => Some(0),
@@ -363,6 +367,11 @@ pub fn parse_netex(
                     "ToDate" => {
                         if parent == "UicOperatingPeriod" {
                             current_uic_to = text_buf.clone();
+                        }
+                    }
+                    "ValidDayBits" => {
+                        if parent == "UicOperatingPeriod" {
+                            current_uic_bits = text_buf.clone();
                         }
                     }
                     "Time" => {
@@ -459,10 +468,14 @@ pub fn parse_netex(
                             let start = to_ymd(&current_uic_from);
                             let end = to_ymd(&current_uic_to);
                             uic_periods.insert(current_uic_id.clone(), (start, end));
+                            if !current_uic_bits.is_empty() {
+                                uic_period_bits.insert(current_uic_id.clone(), current_uic_bits.clone());
+                            }
                         }
                         current_uic_id.clear();
                         current_uic_from.clear();
                         current_uic_to.clear();
+                        current_uic_bits.clear();
                     }
                     "Quay" => {
                         stops.push(Stop {
@@ -640,59 +653,110 @@ pub fn parse_netex(
         }
         buf.clear();
     }
+        // Build calendars and calendar_dates based on used_service_ids, DayType and UicOperatingPeriod
+        for service_id in used_service_ids {
+            // Base weekdays from DayType; start with all-zero and derive if missing
+            let mut weekdays = day_type_weekdays
+                .get(&service_id)
+                .copied()
+                .unwrap_or([0, 0, 0, 0, 0, 0, 0]);
 
-    // Ensure every operator referenced via OperatorRef has an agency row
-    for op_id in &seen_operator_ids {
-        if !agencies.iter().any(|a: &Agency| &a.agency_id == op_id) {
-            agencies.push(Agency {
-                agency_id: op_id.clone(),
-                agency_name: op_id.clone(),
-                agency_url: String::new(),
-                agency_timezone: default_agency_timezone.to_string(),
-                agency_lang: String::new(),
+            // Try to infer corresponding UicOperatingPeriod id from DayType id
+            let mut period_id = String::new();
+            if service_id.contains("DayType:") {
+                period_id = service_id.replace("DayType:", "UicOperatingPeriod:");
+            }
+            // Also allow direct use if service_id itself is a UicOperatingPeriod id
+            let period_key = if uic_periods.contains_key(&service_id) {
+                service_id.clone()
+            } else {
+                period_id.clone()
+            };
+
+            let (start_date, end_date, bits_opt) = if let Some((s, e)) = uic_periods.get(&period_key) {
+                let bits = uic_period_bits.get(&period_key).cloned();
+                (s.clone(), e.clone(), bits)
+            } else {
+                // Fallback wide range if no specific period is found
+                ("20240101".to_string(), "20261231".to_string(), None)
+            };
+
+            // If weekday flags are all zero but we have ValidDayBits, derive them from the bitmask
+            if weekdays.iter().all(|&d| d == 0) {
+                if let Some(ref bits) = bits_opt {
+                    if let (Ok(mut date), Ok(end_naive)) = (
+                        NaiveDate::parse_from_str(&start_date, "%Y%m%d"),
+                        NaiveDate::parse_from_str(&end_date, "%Y%m%d"),
+                    ) {
+                        let bytes = bits.as_bytes();
+                        let mut idx = 0usize;
+                        while date <= end_naive && idx < bytes.len() {
+                            if bytes[idx] == b'1' {
+                                let dow = date.weekday().num_days_from_monday() as usize;
+                                if dow < 7 {
+                                    weekdays[dow] = 1;
+                                }
+                            }
+                            date += Duration::days(1);
+                            idx += 1;
+                        }
+                    }
+                }
+            }
+
+            // If still all zeros (no DayType & no bits), fall back to all days to avoid an unusable calendar row
+            if weekdays.iter().all(|&d| d == 0) {
+                weekdays = [1, 1, 1, 1, 1, 1, 1];
+            }
+
+            calendars.push(Calendar {
+                service_id: service_id.clone(),
+                monday: weekdays[0],
+                tuesday: weekdays[1],
+                wednesday: weekdays[2],
+                thursday: weekdays[3],
+                friday: weekdays[4],
+                saturday: weekdays[5],
+                sunday: weekdays[6],
+                start_date: start_date.clone(),
+                end_date: end_date.clone(),
             });
+
+            // Derive calendar_dates to make the calendar + exceptions exactly match ValidDayBits
+            if let Some(bits) = bits_opt {
+                if let (Ok(mut date), Ok(end_naive)) = (
+                    NaiveDate::parse_from_str(&start_date, "%Y%m%d"),
+                    NaiveDate::parse_from_str(&end_date, "%Y%m%d"),
+                ) {
+                    let bytes = bits.as_bytes();
+                    let mut idx = 0usize;
+                    while date <= end_naive {
+                        let active = if idx < bytes.len() { bytes[idx] == b'1' } else { false };
+                        let dow = date.weekday().num_days_from_monday() as usize;
+                        let should = weekdays[dow] == 1;
+
+                        if active && !should {
+                            // Service actually runs on this date, but weekday pattern says it shouldn't: add exception_type=1
+                            calendar_dates.push(CalendarDate {
+                                service_id: service_id.clone(),
+                                date: date.format("%Y%m%d").to_string(),
+                                exception_type: 1,
+                            });
+                        } else if !active && should {
+                            // Weekday pattern says service, but bitmask doesn't: remove with exception_type=2
+                            calendar_dates.push(CalendarDate {
+                                service_id: service_id.clone(),
+                                date: date.format("%Y%m%d").to_string(),
+                                exception_type: 2,
+                            });
+                        }
+
+                        date += Duration::days(1);
+                        idx += 1;
+                    }
+                }
+            }
         }
-    }
-    
-    // Build calendars based on used service_ids, DayType and UicOperatingPeriod
-    for service_id in used_service_ids {
-        let weekdays = day_type_weekdays
-            .get(&service_id)
-            .copied()
-            .unwrap_or([1, 1, 1, 1, 1, 1, 1]);
-
-        // Try to infer corresponding UicOperatingPeriod id from DayType id
-        let mut period_id = String::new();
-        if service_id.contains("DayType:") {
-            period_id = service_id.replace("DayType:", "UicOperatingPeriod:");
-        }
-        // Also allow direct use if service_id itself is a UicOperatingPeriod id
-        let period_key = if uic_periods.contains_key(&service_id) {
-            service_id.clone()
-        } else {
-            period_id.clone()
-        };
-
-        let (start_date, end_date) = if let Some((s, e)) = uic_periods.get(&period_key) {
-            (s.clone(), e.clone())
-        } else {
-            // Fallback wide range if no specific period is found
-            ("20240101".to_string(), "20261231".to_string())
-        };
-
-        calendars.push(Calendar {
-            service_id: service_id.clone(),
-            monday: weekdays[0],
-            tuesday: weekdays[1],
-            wednesday: weekdays[2],
-            thursday: weekdays[3],
-            friday: weekdays[4],
-            saturday: weekdays[5],
-            sunday: weekdays[6],
-            start_date,
-            end_date,
-        });
-    }
 
     // Keep a default calendar only if none could be constructed
     if calendars.is_empty() {
