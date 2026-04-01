@@ -1,4 +1,4 @@
-use crate::gtfs::{Calendar, CalendarDate, Route, Stop, StopTime, Trip};
+use crate::gtfs::{Agency, Calendar, CalendarDate, Route, Stop, StopTime, Trip};
 use quick_xml::events::Event;
 use quick_xml::Reader;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -7,6 +7,7 @@ use std::fs::File;
 use std::path::Path;
 
 pub struct GtfsModel {
+    pub agencies: Vec<Agency>,
     pub stops: Vec<Stop>,
     pub routes: Vec<Route>,
     pub trips: Vec<Trip>,
@@ -25,13 +26,18 @@ struct Call {
     dep_time: Option<String>,
 }
 
-pub fn parse_netex(path: &Path) -> Result<GtfsModel, Box<dyn std::error::Error>> {
+pub fn parse_netex(
+    path: &Path,
+    default_agency_name: &str,
+    default_agency_timezone: &str,
+) -> Result<GtfsModel, Box<dyn std::error::Error>> {
     let mut reader = Reader::from_file(path)?;
     reader.config_mut().trim_text(true);
 
     let mut buf = Vec::new();
     let mut path_stack = Vec::new();
 
+    let mut agencies = Vec::new();
     let mut stops = Vec::new();
     let mut routes = Vec::new();
     let mut trips = Vec::new();
@@ -41,6 +47,9 @@ pub fn parse_netex(path: &Path) -> Result<GtfsModel, Box<dyn std::error::Error>>
 
     // Map Quay -> parent StopPlace
     let mut quay_to_parent: FxHashMap<String, String> = FxHashMap::default();
+
+    // Map route_id (Line id or synthetic id) -> agency_id (Operator id)
+    let mut line_to_agency: FxHashMap<String, String> = FxHashMap::default();
     
     // State variables
     let mut current_stop_place_id = String::new();
@@ -67,6 +76,7 @@ pub fn parse_netex(path: &Path) -> Result<GtfsModel, Box<dyn std::error::Error>>
     let mut current_vj_line_ref = String::new();
     let mut current_vj_service_id = String::new();
     let mut current_vj_name = String::new();
+    let mut current_vj_operator_id = String::new();
     
     let mut current_calls: Vec<Call> = Vec::new();
     let mut current_call = Call::default();
@@ -83,6 +93,16 @@ pub fn parse_netex(path: &Path) -> Result<GtfsModel, Box<dyn std::error::Error>>
 
     // Track which service_ids actually appear in trips
     let mut used_service_ids: FxHashSet<String> = FxHashSet::default();
+
+    // Track operators encountered via OperatorRef (even if no <Operator> element is present)
+    let mut seen_operator_ids: FxHashSet<String> = FxHashSet::default();
+
+    // Operator state (for agency.txt)
+    let mut current_operator_id = String::new();
+    let mut current_operator_name = String::new();
+    let mut current_operator_url = String::new();
+    let mut current_operator_timezone = String::new();
+    let mut current_operator_lang = String::new();
 
     let mut text_buf = String::new();
 
@@ -101,6 +121,15 @@ pub fn parse_netex(path: &Path) -> Result<GtfsModel, Box<dyn std::error::Error>>
                 };
 
                 match name.as_str() {
+                    "Operator" => {
+                        if let Some(id) = get_attr("id") {
+                            current_operator_id = id;
+                            current_operator_name.clear();
+                            current_operator_url.clear();
+                            current_operator_timezone = get_attr("timeZone").unwrap_or_default();
+                            current_operator_lang = get_attr("xml:lang").unwrap_or_default();
+                        }
+                    }
                     "DayType" => {
                         if let Some(id) = get_attr("id") {
                             current_day_type_id = id;
@@ -144,6 +173,7 @@ pub fn parse_netex(path: &Path) -> Result<GtfsModel, Box<dyn std::error::Error>>
                             current_vj_line_ref.clear();
                             current_vj_service_id = "default".to_string();
                             current_vj_name.clear();
+                            current_vj_operator_id.clear();
                             current_calls.clear();
                         }
                     }
@@ -188,6 +218,12 @@ pub fn parse_netex(path: &Path) -> Result<GtfsModel, Box<dyn std::error::Error>>
                     "LineRef" => {
                         if let Some(ref_id) = get_attr("ref") {
                             current_vj_line_ref = ref_id;
+                        }
+                    }
+                    "OperatorRef" => {
+                        if let Some(ref_id) = get_attr("ref") {
+                            current_vj_operator_id = ref_id.clone();
+                            seen_operator_ids.insert(ref_id);
                         }
                     }
                     "OperatingPeriodRef" | "DayTypeRef" => {
@@ -237,6 +273,12 @@ pub fn parse_netex(path: &Path) -> Result<GtfsModel, Box<dyn std::error::Error>>
                             current_vj_line_ref = ref_id;
                         }
                     }
+                    "OperatorRef" => {
+                        if let Some(ref_id) = get_attr("ref") {
+                            current_vj_operator_id = ref_id.clone();
+                            seen_operator_ids.insert(ref_id);
+                        }
+                    }
                     "OperatingPeriodRef" | "DayTypeRef" => {
                         if let Some(ref_id) = get_attr("ref") {
                             current_vj_service_id = ref_id;
@@ -277,7 +319,9 @@ pub fn parse_netex(path: &Path) -> Result<GtfsModel, Box<dyn std::error::Error>>
                         }
                     }
                     "Name" => {
-                        if parent == "StopPlace" {
+                        if parent == "Operator" {
+                            current_operator_name = text_buf.clone();
+                        } else if parent == "StopPlace" {
                             current_stop_place_name = text_buf.clone();
                         } else if parent == "Quay" {
                             current_quay_name = text_buf.clone();
@@ -332,6 +376,18 @@ pub fn parse_netex(path: &Path) -> Result<GtfsModel, Box<dyn std::error::Error>>
                     "DepartureTime" | "TargetDepartureTime" | "TimetabledDepartureTime" => {
                         if parent == "TimetabledPassingTime" || parent == "Call" || parent == "TargetPassingTime" {
                             current_call.dep_time = Some(text_buf.clone());
+                        }
+                    }
+                    "Url" => {
+                        if parent == "ContactDetails" && gparent == "Operator" {
+                            current_operator_url = text_buf.clone();
+                        } else if parent == "Operator" {
+                            current_operator_url = text_buf.clone();
+                        }
+                    }
+                    "TimeZone" => {
+                        if parent == "Operator" {
+                            current_operator_timezone = text_buf.clone();
                         }
                     }
                     "ScheduledStopPoint" => {
@@ -452,6 +508,13 @@ pub fn parse_netex(path: &Path) -> Result<GtfsModel, Box<dyn std::error::Error>>
                             current_vj_line_ref.clone()
                         };
 
+                        // Remember which agency operates this route (if known)
+                        if !current_vj_operator_id.is_empty() {
+                            line_to_agency
+                                .entry(synthetic_route_id.clone())
+                                .or_insert(current_vj_operator_id.clone());
+                        }
+
                         if !current_vj_id.is_empty() {
                             trips.push(Trip {
                                 route_id: synthetic_route_id,
@@ -493,6 +556,38 @@ pub fn parse_netex(path: &Path) -> Result<GtfsModel, Box<dyn std::error::Error>>
                             }
                         }
                     }
+                    "Operator" => {
+                        if !current_operator_id.is_empty() {
+                            let agency_id = current_operator_id.clone();
+                            let agency_name = if !current_operator_name.is_empty() {
+                                current_operator_name.clone()
+                            } else {
+                                agency_id.clone()
+                            };
+                            let agency_url = current_operator_url.clone();
+                            let agency_timezone = if !current_operator_timezone.is_empty() {
+                                current_operator_timezone.clone()
+                            } else {
+                                default_agency_timezone.to_string()
+                            };
+                            let agency_lang = current_operator_lang.clone();
+
+                            if !agencies.iter().any(|a: &Agency| a.agency_id == agency_id) {
+                                agencies.push(Agency {
+                                    agency_id,
+                                    agency_name,
+                                    agency_url,
+                                    agency_timezone,
+                                    agency_lang,
+                                });
+                            }
+                        }
+                        current_operator_id.clear();
+                        current_operator_name.clear();
+                        current_operator_url.clear();
+                        current_operator_timezone.clear();
+                        current_operator_lang.clear();
+                    }
                     _ => {}
                 }
                 path_stack.pop();
@@ -501,6 +596,19 @@ pub fn parse_netex(path: &Path) -> Result<GtfsModel, Box<dyn std::error::Error>>
             _ => (),
         }
         buf.clear();
+    }
+
+    // Ensure every operator referenced via OperatorRef has an agency row
+    for op_id in &seen_operator_ids {
+        if !agencies.iter().any(|a: &Agency| &a.agency_id == op_id) {
+            agencies.push(Agency {
+                agency_id: op_id.clone(),
+                agency_name: op_id.clone(),
+                agency_url: String::new(),
+                agency_timezone: default_agency_timezone.to_string(),
+                agency_lang: String::new(),
+            });
+        }
     }
     
     // Build calendars based on used service_ids, DayType and UicOperatingPeriod
@@ -552,12 +660,40 @@ pub fn parse_netex(path: &Path) -> Result<GtfsModel, Box<dyn std::error::Error>>
             end_date: "20261231".to_string(),
         });
     }
+    
+    // Attach agencies to routes (agency_id) where we know the mapping
+    if !agencies.is_empty() {
+        for route in &mut routes {
+            if let Some(aid) = line_to_agency.get(&route.route_id) {
+                route.agency_id = Some(aid.clone());
+            } else if agencies.len() == 1 {
+                // Single-agency feed: default all routes to that agency
+                route.agency_id = Some(agencies[0].agency_id.clone());
+            }
+        }
+    } else {
+        // No operators at all: create a single default agency and assign it
+        agencies.push(Agency {
+            agency_id: "default".to_string(),
+            agency_name: default_agency_name.to_string(),
+            agency_url: String::new(),
+            agency_timezone: default_agency_timezone.to_string(),
+            agency_lang: String::new(),
+        });
+        for route in &mut routes {
+            route.agency_id = Some("default".to_string());
+        }
+    }
 
-    Ok(GtfsModel { stops, routes, trips, stop_times, calendars, calendar_dates })
+    Ok(GtfsModel { agencies, stops, routes, trips, stop_times, calendars, calendar_dates })
 }
 
 pub fn export_gtfs(model: &GtfsModel, out_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     fs::create_dir_all(out_dir)?;
+
+    let mut wtr = csv::Writer::from_path(out_dir.join("agency.txt"))?;
+    for a in &model.agencies { wtr.serialize(a)?; }
+    wtr.flush()?;
 
     let mut wtr = csv::Writer::from_path(out_dir.join("stops.txt"))?;
     for s in &model.stops { wtr.serialize(s)?; }
